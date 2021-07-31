@@ -1,0 +1,35 @@
+resolver: lts-14.27
+
+packages:
+- .
+- ../fei-base
+- ../fei-nn
+- ../tuple-ops
+extra-deps:
+- chessIO-0.8.0.0
+- type-sets-0.1.1.0
+- cmptype-0.2.0.0
+- magic-tyfams-0.1.1.0
+- megaparsec-9.0.0
+- th-compat-0.1.2
+- o-clock-1.2.1
+- random-1.2.0
+- splitmix-0.1.0.3
+- MonadRandom-0.5.3
+- QuickCheck-2.14.2
+- data-clist-0.1.2.3
+- rio-0.1.20.0
+- unliftio-0.2.19
+- git: https://github.com/0xCM/type-combinators.git
+  commit: 58167dd4017b666ff592bb9493b0570a054aabdb
+- git: https://github.com/pierric/haskell-src-exts.git
+  commit: 792ec73bc3b0e8d4aa2683af6b2a3fc03b5f8d95
+- git: https://github.com/aisamanra/config-ini.git
+  commit: 35dd9a28d32fde6c78b778653359579d65386d79
+extra-include-dirs:
+- /home/jiasen/workspace/mxnet/build-1.8.0/include
+extra-lib-dirs:
+- /home/jiasen/workspace/mxnet/build-1.8.0
+flags:
+  fei-base:
+    mxnet_geq_10800: true
