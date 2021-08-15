@@ -28,7 +28,9 @@ dependencies:
 - random >= 1.2
 - mwc-random
 - constraints
+- conduit
 - fei-base >= 2 && < 3
+- fei-nn >= 2 && < 3
 
 library:
   source-dirs: src
@@ -46,6 +48,7 @@ executables:
     dependencies:
     - lambda-chess
     - formatting
+    - vector-algorithms
     - fei-nn >= 2 && < 3
     default-extensions:
       NoImplicitPrelude

@@ -6,7 +6,6 @@
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
-{-# LANGUAGE TypeSynonymInstances  #-}
 module Fei.AI.MCTS where
 
 import           Control.Lens       (makeLenses, (+~))
@@ -18,12 +17,8 @@ import qualified RIO.Vector.Partial as V
 import           RIO.Writer
 
 cSCALAR, cEPSILON :: Float
-cSCALAR = 1 / sqrt(2.0)
+cSCALAR = 1 / sqrt 2.0
 cEPSILON = 1e-4
-
-type Succ a = a -> Vector a
-type Choose m a = Vector a -> m a
-type Judge a = a -> Float
 
 data Node a =
     Node { _node_v        :: a
@@ -34,6 +29,10 @@ data Node a =
     deriving Show
 
 makeLenses ''Node
+
+type Succ m a v = Cursor a -> m (Vector (Node a, v))
+type Choose m a v = Vector (Node a, v) -> m (Node a)
+type Judge a = a -> Float
 
 class UpwardeNavigable z a where
     type UpwardZipper z a
@@ -64,11 +63,10 @@ childAt :: Int -> Cursor a -> Cursor a
 childAt n (Cursor c) = Cursor $
     c & downward node_children & fromWithin traverse & moveToward n
 
-expand :: Succ a -> Cursor a -> Cursor a
-expand succ (Cursor z) =
-    let val = z & downward node_v & view focus
-        children = V.map (\a -> Node a 0 0 V.empty) (succ val)
-     in Cursor $ z & focus . node_children %~ (V.++ children)
+expand :: MonadIO m => Succ m a v -> Cursor a -> m (Cursor a)
+expand succ cur@(Cursor z) = do
+    children <- succ cur <&> V.map fst
+    return $ Cursor $ z & focus . node_children %~ (V.++ children)
 
 select :: (HasCallStack, Monad m) => Cursor a -> WriterT [Int] m (Cursor a)
 select c@(Cursor z)
@@ -81,13 +79,16 @@ select c@(Cursor z)
     where
         cur_node = z & view focus
 
-simulate :: MonadIO m => Succ a -> Choose m a -> Judge a -> Cursor a -> m Float
-simulate succ choose judge (Cursor z) = go (z & downward node_v & view focus)
+simulate :: MonadIO m => Succ m a v -> Choose m a v -> Judge a -> Cursor a -> m Float
+simulate succ choose judge cur@(Cursor z) = go cur
     where
-        go v = let space = succ v
-                in if null space
-                      then return $ judge v
-                      else choose space >>= go
+        go cur@(Cursor z) = do
+            space <- succ cur
+            if null space
+              then return $ judge $ view (focus . node_v) z
+              else do
+                  n <- choose space
+                  go $ Cursor $ zipper n
 
 backward :: Int -> Cursor a -> Float -> Cursor a
 backward n (Cursor z) reward =
@@ -101,9 +102,9 @@ backward n (Cursor z) reward =
                        Just (pz, Dict, Dict, Dict) -> backward (n-1) (Cursor pz) (-reward)
 
 mcts :: (HasCallStack, MonadIO m)
-     => Succ a -> Choose m a -> Judge a
+     => Succ m a v -> Choose m a v -> Judge a
      -> Int -> Cursor a -> m (Maybe (Int, Cursor a))
-mcts succ choose judge num_rollout node = go num_rollout node
+mcts succ choose judge = go
     where
         expected_reward n = n ^. node_q / (fromIntegral (n ^. node_n) + cEPSILON)
         go 0 root@(Cursor z) = do
@@ -116,7 +117,7 @@ mcts succ choose judge num_rollout node = go num_rollout node
         go n root = do
             (cur_at_leaf, path) <- runWriterT $ select root
 
-            let cur_expanded = expand succ cur_at_leaf
+            cur_expanded <- expand succ cur_at_leaf
             reward <- simulate succ choose judge cur_expanded
 
             let root_updated = backward (length path) cur_expanded reward

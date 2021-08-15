@@ -36,8 +36,10 @@ library
   build-depends:
       base >=4.7 && <5
     , chessIO
+    , conduit
     , constraints
     , fei-base ==2.*
+    , fei-nn ==2.*
     , lens
     , mwc-random
     , random >=1.2
@@ -57,6 +59,7 @@ executable lambda-chess-exe
   build-depends:
       base >=4.7 && <5
     , chessIO
+    , conduit
     , constraints
     , fei-base ==2.*
     , fei-nn ==2.*
@@ -66,6 +69,7 @@ executable lambda-chess-exe
     , mwc-random
     , random >=1.2
     , rio
+    , vector-algorithms
     , zippers
   default-language: Haskell2010
 
@@ -80,8 +84,10 @@ test-suite lambda-chess-test
   build-depends:
       base >=4.7 && <5
     , chessIO
+    , conduit
     , constraints
     , fei-base ==2.*
+    , fei-nn ==2.*
     , lambda-chess
     , lens
     , mwc-random

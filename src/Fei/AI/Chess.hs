@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns          #-}
 {-# LANGUAGE FlexibleContexts      #-}
 {-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE PartialTypeSignatures #-}
@@ -6,28 +7,32 @@
 module Fei.AI.Chess where
 
 import           Control.Applicative
-import           Control.Lens           (each, enum, from, makeLenses)
+import           Control.Lens                 (each, enum, from, makeLenses)
+import           Control.Monad                (replicateM)
 import           Control.Zipper
-import           Data.Bifunctor         (bimap)
+import           Data.Bifunctor               (bimap)
 import           Data.Char
-import           Data.Constraint        (Dict (..))
+import qualified Data.Conduit                 as C (ConduitT, (.|))
+import qualified Data.Conduit.List            as C (mapM, sourceList)
+import           Data.Constraint              (Dict (..))
 import           Game.Chess
 import           RIO
-import           RIO.List               (inits, scanr, unzip)
-import           RIO.List.Partial       (head, init, tail)
-import qualified RIO.NonEmpty           as NE
-import           RIO.Partial            (fromJust, toEnum)
-import qualified RIO.Vector             as V
-import qualified RIO.Vector.Partial     as V
-import qualified RIO.Vector.Storable    as VS
+import           RIO.List                     (inits, repeat, scanr, unzip)
+import           RIO.List.Partial             (head, init, tail)
+import qualified RIO.NonEmpty                 as NE
+import qualified RIO.NonEmpty.Partial         as NE
+import           RIO.Partial                  (fromJust, toEnum)
+import qualified RIO.Vector                   as V
+import qualified RIO.Vector.Partial           as V
+import qualified RIO.Vector.Storable          as VS
 import           RIO.Writer
 import           System.Random
 import           System.Random.MWC
-import           System.Random.Stateful (IOGenM, newIOGenM, uniformRM)
+import           System.Random.Stateful       (IOGenM, newIOGenM, uniformRM)
 
 import           Fei.AI.MCTS
 import           MXNet.Base
-import           MXNet.Base.Tensor      as T
+import qualified MXNet.Base.Tensor.Functional as F
 
 instance Enum PieceType where
     toEnum 0 = Pawn
@@ -48,7 +53,7 @@ newtype EncodedPieces = EncodedPieces [(Rank, File, Int)]
 newtype EncodedRepetitions = EncodedRepetitions [Int]
 
 data BoardState = BoardState
-    { _board_position :: Position
+    { _board_position :: !Position
     , _board_ply      :: Maybe Ply
     }
 makeLenses ''BoardState
@@ -63,15 +68,20 @@ stalemate pos = null (legalPlies pos) && not (inCheck (color pos) pos)
 
 draw pos = insufficientMaterial pos || stalemate pos
 
-succ_pos :: HasCallStack => BoardState -> Vector BoardState
-succ_pos (BoardState pos _)
-  | insufficientMaterial pos = V.empty
-  | otherwise = let actions = legalPlies pos
-                 in V.fromList $ map (\a -> BoardState (doPly pos a) (Just a)) actions
+succPositions :: (HasCallStack, MonadIO m) => Succ m BoardState ()
+succPositions (Cursor z) =
+    return $ case view (focus . node_v) z of
+      BoardState pos _
+        | insufficientMaterial pos -> V.empty
+        | otherwise -> let actions = legalPlies pos
+                           makeChild a = (Node (BoardState (doPly pos a) (Just a)) 0 0 V.empty, ())
+                        in V.fromList $ map makeChild actions
 
-uniformly_choose gen options = do
+uniformlyChoose :: (MonadIO m, RandomGen g)
+                => IOGenM g -> Choose m a v
+uniformlyChoose gen options = do
     a <- uniformRM (0, V.length options - 1) gen
-    return $ options V.! a
+    return $ fst $ options V.! a
 
 data Outcome = Win Color
              | Draw
@@ -112,19 +122,24 @@ getPosition (Cursor cur) = view (focus . node_v . board_position) cur
 --   simulation step.
 --
 --   Returns the final cusor and full list of play steps.
-play :: HasCallStack => Choose IO BoardState -> Int -> IO (Cursor BoardState, [Ply])
-play choose n_rollout = do
+play :: (HasCallStack, MonadIO m)
+     => Succ m BoardState v
+     -> Choose m BoardState v
+     -> Int
+     -> m (Cursor BoardState, [Ply])
+play succ choose n_rollout = do
     let cur = Cursor $ zipper $ Node (BoardState startpos Nothing) 0 0 V.empty
-    runWriterT $ go cur
+    (!c, !p) <- runWriterT $ go cur
+    return (c, p)
     where
-        go :: Cursor BoardState -> WriterT [Ply] IO (Cursor BoardState)
+        -- go :: Cursor BoardState -> WriterT [Ply] m (Cursor BoardState)
         go cur@(Cursor z) = do
 
             case z & view (focus . node_v . board_ply) of
               Just ply -> tell [ply]
               Nothing  -> return ()
 
-            next <- mcts succ_pos (liftIO . choose) (reward . judge) n_rollout cur
+            next <- mcts (lift . succ) (lift . choose) (reward . judge) n_rollout cur
             case next of
               Nothing         -> return cur
               Just (sel, cur) -> go (childAt sel cur)
@@ -153,9 +168,9 @@ encodePly color ply = encQueenMove <|> encKnightMove <|> encUnderPromotion
         src = plySource ply ^. rankFile
         dst = plyTarget ply ^. rankFile
 
-        rotateIfBlack p
-          | color == White = p
-          | color == Black = rotateSquare p
+        rotateIfBlack = case color of
+                          White -> id
+                          Black -> rotateSquare
         (src_rank, src_file) = rotateIfBlack src & bimap fromEnum fromEnum
         (tgt_rank, tgt_file) = rotateIfBlack dst & bimap fromEnum fromEnum
 
@@ -235,7 +250,7 @@ encodeBoardMeta pos =
 
 -- | Encode the pieces
 encodeBoardPieces :: Position -> EncodedPieces
-encodeBoardPieces pos = EncodedPieces $ catMaybes $ map read_square [minBound..maxBound]
+encodeBoardPieces pos = EncodedPieces $ mapMaybe read_square [minBound..maxBound]
     where
         read_square square = pieceAt pos square <&> to_ind (rank square) (file square)
         to_ind rank file (color, piece_type) =
@@ -245,110 +260,130 @@ encodeBoardPieces pos = EncodedPieces $ catMaybes $ map read_square [minBound..m
              in (rank, file, fromEnum piece_type + offset)
 
 -- | Encode the repetition status
-encodeBoardRepetitions :: [Position] -> EncodedRepetitions
-encodeBoardRepetitions hist@(last:_) =
-    let count = length $ filter (== last) hist
-        rept2 = fromEnum (count == 2)
-        rept3 = fromEnum (count == 3)
-     in EncodedRepetitions [rept2, rept3]
-
--- | Encode several information and prepare input/output for neural network's training
-prepareTraining :: MonadIO m
-                => Cursor BoardState -> m [(NDArray Float, NDArray Float, Float)]
-prepareTraining c@(Cursor z)
-  | outcome == Undecided = error "cannot get training data from an unfinished game"
-  | otherwise = let stepwise = tail . inits
-                    -- dropping the last step, and make replays (from step 0 to n) at each step
-                    replay_each_step = stepwise $ NE.init $ history c
-                    -- check the 2/3 repetition status of each replay
-                    repetition_status = map checkRepetition replay_each_step
-                 in liftIO $ zipWithM build replay_each_step $ stepwise repetition_status
+checkRepetition :: NonEmpty (Cursor BoardState) -> EncodedRepetitions
+checkRepetition = checkAndEncode . NE.map getPosition
     where
-        outcome = z & view (focus . node_v) & judge
+    checkAndEncode hist@(last NE.:| _) =
+        let count = length $ NE.filter (== last) hist
+            rept2 = fromEnum (count == 2)
+            rept3 = fromEnum (count == 3)
+         in EncodedRepetitions [rept2, rept3]
 
-        checkRepetition :: [Cursor BoardState] -> EncodedRepetitions
-        checkRepetition = encodeBoardRepetitions . map getPosition
+-- tail of inits guarantees to be NonEmpty if any
+stepwise :: NonEmpty a -> NonEmpty (NonEmpty a)
+stepwise = NE.map NE.fromList . NE.fromList . NE.tail . NE.inits
 
+_buildInp :: NonEmpty (Cursor BoardState) -> NonEmpty EncodedRepetitions -> IO (NDArray Float)
+_buildInp replay reps_enc = do
+    -- encode the following
+    -- + meta
+    -- + pieces
+    -- + 2/3 repetition
+    let rev_cur@(last_cur NE.:| _) = NE.reverse replay
+        rev_pos@(last_pos NE.:| _) = NE.map getPosition rev_cur
+        color_   = color last_pos
+
+        meta :: [Float]
+        meta     = map fromIntegral $ encodeBoardMeta last_pos
+
+        reps :: [[Float]]
+        reps     = map (\(EncodedRepetitions a) -> map fromIntegral a) $
+                   reverse $ NE.take cNumLookBack reps_enc
+
+        encode   = rotateIfBlack color_ . encodeBoardPieces
+
+        enc_replay :: [EncodedPieces]
+        enc_replay = map encode $ reverse $ NE.take cNumLookBack rev_pos
+
+    -- meta: (7,)
+    meta  <- toNDArray [1, 1, 7] meta
+    -- repetition flags: (cNumLookBack x 2, )
+    reps  <- toNDArrayPadded [1, 1, cNumLookBack * 2] (concat reps)
+
+    -- board feature: (8, 8, cNumLookBack x 12)
+    board <- let cvt (EncodedPieces pl) =
+                     map (\(r, f, i) -> ([fromEnum r, fromEnum f, i], 1)) pl
+              in mapM (scatter [8, 8, 12] . cvt) enc_replay
+
+    board <- let board_len = length board
+              in case compare board_len cNumLookBack of
+                   EQ -> pure board
+                   GT -> error "too many boards"
+                   LT -> do
+                       padding <- replicateM (cNumLookBack - board_len) $ ndZeros [8, 8, 12]
+                       pure (padding ++ board)
+
+    -- broadcast meta, reps to (8, 8, x)
+    let b0 = head board
+    meta  <- F.broadcastLikeAxis (meta, [0, 1]) (b0, [0, 1])
+    reps  <- F.broadcastLikeAxis (reps, [0, 1]) (b0, [0, 1])
+    -- return: (8, 8, cNumLookBack x 14 + 7), meta <+> reps <+> board
+    --         and transpose to (_, 8, 8)
+    F.concat_ (-1) (board ++ [reps, meta]) >>= flip F.transpose [2, 0, 1]
+
+    where
         rotateIfBlack White = id
         rotateIfBlack Black = rotateEncodedPieces
 
-        -- build :: [Cursor BoardState] -> [EncodedRepetitions] -> IO _
-        build replay reps_enc = do
-            -- encode the following
-            -- * meta
-            -- * pieces
-            -- * 2/3 repetition
-            let rev_cur@(last_cur:_) = reverse replay
-                rev_pos@(last_pos:_) = map getPosition rev_cur
-                color_   = color last_pos
 
-                outcome_ = reward outcome * case color_ of
-                                              White ->  1
-                                              Black -> -1
+_buildGt :: NonEmpty (Cursor BoardState) -> Outcome -> IO (NDArray Float, Float)
+_buildGt replay outcome = do
+    let rev_cur@(last_cur NE.:| _) = NE.reverse replay
+        rev_pos@(last_pos NE.:| _) = NE.map getPosition rev_cur
+        color_   = color last_pos
+        count s  = let a = fromJust $ s ^. node_v . board_ply
+                       n = s ^. node_n
+                    in (a, n)
+        norm ac  = let (as, cs) = V.unzip ac
+                       s = fromIntegral $ sum cs
+                       as' = V.map (\a -> [encodePly color_ a & fromJust]) as
+                       cs' = V.map (\c -> fromIntegral c / s) cs
+                    in V.zip as' cs'
 
-                meta :: [Float]
-                meta     = map fromIntegral $ encodeBoardMeta last_pos
+        actions :: Vector ([Int], Float)
+        actions  = let pos = case last_cur of
+                               Cursor z -> z & view (focus . node_children)
+                    in norm $ V.map count pos
 
-                reps :: [[Float]]
-                reps     = map (\(EncodedRepetitions a) -> map fromIntegral a) $
-                           reverse $ take cNumLookBack reps_enc
+    -- pi : (4672,)
+    pi    <- scatter [4672] $ V.toList actions
+    -- outcome: Float
+    let outcome_ = reward outcome * case color_ of
+                                      White ->  1
+                                      Black -> -1
+    return (pi, outcome_)
 
-                encode   = rotateIfBlack color_ . encodeBoardPieces
 
-                enc_replay :: [EncodedPieces]
-                enc_replay = map encode $ reverse $ take cNumLookBack rev_pos
+-- | encode the current play information for model inference
+encodeForInference :: (HasCallStack, MonadIO m)
+                   => Cursor BoardState -> m (NDArray Float)
+encodeForInference c@(Cursor z) = liftIO $ do
+    let replay_full = history c
+        -- check the 2/3 repetition status at each past step
+        replay_each_step  = stepwise replay_full
+        repetition_status = NE.map checkRepetition replay_each_step
+    _buildInp replay_full repetition_status
 
-                count s  = let a = fromJust $ s ^. node_v . board_ply
-                               n = s ^. node_n
-                            in (a, n)
-                norm ac  = let (as, cs) = V.unzip ac
-                               s = fromIntegral $ sum cs
-                               as' = V.map (\a -> [encodePly color_ a & fromJust]) as
-                               cs' = V.map (\c -> fromIntegral c / s) cs
-                            in V.zip as' cs'
-
-                actions :: Vector ([Int], Float)
-                actions  = let pos = case last_cur of
-                                       Cursor z -> z & view (focus . node_children)
-                            in norm $ V.map count $ pos
-            -- meta: (7,)
-            meta  <- toNDArray [1, 1, 7] meta
-            -- repetition flags: (cNumLookBack x 2, )
-            reps  <- toNDArrayPadded [1, 1, cNumLookBack * 2] (concat reps)
-
-            -- board feature: (8, 8, cNumLookBack x 12)
-            board <- let cvt (EncodedPieces pl) =
-                             map (\(r, f, i) -> ([fromEnum r, fromEnum f, i], 1)) pl
-                      in mapM (scatter [8, 8, 12] . cvt) enc_replay
-
-            board <- let board_len = length board
-                      in case compare board_len cNumLookBack of
-                           EQ -> pure board
-                           GT -> error "too many boards"
-                           LT -> do
-                               padding <- sequence $ replicate (cNumLookBack - board_len) $
-                                          ndZeros [8, 8, 12]
-                               pure (padding ++ board)
-
-            -- broadcast meta, reps to (8, 8, x)
-            let b0 = head board
-            meta  <- T.broadcastLikeAxis (meta, [0, 1]) (b0, [0, 1])
-            reps  <- T.broadcastLikeAxis (reps, [0, 1]) (b0, [0, 1])
-            -- input: (8, 8, cNumLookBack x 14 + 7), meta <+> reps <+> board
-            input <- T.concat_ (-1) (board ++ [reps, meta])
-            -- pi : (4672,)
-            pi    <- scatter [4672] $ V.toList actions
-            return (input, pi, outcome_)
-
-        scatter :: [Int] -> [([Int], Float)] -> IO (NDArray Float)
-        scatter shape idx_val = do
-            let (idx, val) = unzip idx_val
-                idx_vec = VS.fromList $ map fromIntegral $ concat idx
-                val_vec = VS.fromList val
-            val_arr <- fromVector [VS.length val_vec] val_vec
-            idx_arr <- fromVector [VS.length val_vec, length (head idx)] idx_vec
-                       >>= flip T.transpose [1, 0]
-            T.scatter idx_arr val_arr shape
+-- | Encode several information and prepare input/output for neural network's training
+encodeForTraining :: MonadIO m
+                  => Cursor BoardState -> C.ConduitT () (NDArray Float, NDArray Float, Float) m ()
+encodeForTraining c@(Cursor z)
+  | outcome == Undecided = error "cannot get training data from an unfinished game"
+  | otherwise = C.sourceList steps C..| C.mapM buildEach
+    where
+        !outcome = z & view (focus . node_v) & judge
+        -- dropping the last step, and make replays (from step 0 to n) at each step
+        -- Note: for a finished game, the length is guaranteed to be > 1
+        replay_each_step = stepwise $ NE.fromList $ NE.init $ history c
+        -- check the 2/3 repetition status of each replay
+        repetition_status = NE.map checkRepetition replay_each_step
+        -- glue boardstate, repetition, outcome together and for further building
+        steps = zip (NE.toList replay_each_step)
+                    (NE.toList $ stepwise repetition_status)
+        buildEach (replay, rept) = liftIO $ do
+           !inp <- _buildInp replay rept
+           (!distr, !outcome') <- _buildGt  replay outcome
+           return (inp, distr, outcome')
 
 ravel :: [Int] -> [Int] -> Int
 ravel shape index
@@ -358,6 +393,16 @@ ravel shape index
                 -- I may need to exploit the Ix class
                 -- to calculate the linear index
 
+scatter :: [Int] -> [([Int], Float)] -> IO (NDArray Float)
+scatter shape idx_val = do
+    let (idx, val) = unzip idx_val
+        idx_vec = VS.fromList $ map fromIntegral $ concat idx
+        val_vec = VS.fromList val
+    val_arr <- fromVector [VS.length val_vec] val_vec
+    idx_arr <- fromVector [VS.length val_vec, length (head idx)] idx_vec
+               >>= flip F.transpose [1, 0]
+    F.scatter idx_arr val_arr shape
+
 toNDArray :: NumericDType a => [Int] -> [a] -> IO (NDArray a)
 toNDArray shp dat = fromVector shp $ VS.fromList dat
 
@@ -366,9 +411,9 @@ toNDArrayPadded shp dat = do
     a1 <- toNDArray [dat_len] dat
     case compare pad_len 0 of
       LT -> error "expected shape is smaller than the data"
-      EQ -> reshape shp a1
+      EQ -> F.reshape shp a1
       GT -> do a2 <- ndZeros [pad_len]
-               concat_ 0 [a2, a1] >>= reshape shp
+               F.concat_ 0 [a2, a1] >>= F.reshape shp
     where
         dat_vec = VS.fromList dat
         dat_len = VS.length dat_vec

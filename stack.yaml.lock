@@ -109,6 +109,20 @@ packages:
       size: 2423
     hackage: unliftio-0.2.19@sha256:435d7ecbf5333fcf15bb2efe43691ca9c597e2fbbc943d542d247222334f0972,3395
 - original:
+    hackage: uuid-1.3.14
+  completed:
+    pantry-tree:
+      sha256: 343fc87c6ac44c02444eb71e47868979a36ab1220e38a60fe86826d065fcda5e
+      size: 739
+    hackage: uuid-1.3.14@sha256:346445c6c45d69d99cbeb50c4bed1367e17112e5cf6ffc1fe2dfa2f60218e9f5,2561
+- original:
+    hackage: uuid-types-1.0.4
+  completed:
+    pantry-tree:
+      sha256: 1b4d8a26ba0790aca64ac35d358beba47304438442840adcbedd3381888ba838
+      size: 480
+    hackage: uuid-types-1.0.4@sha256:34de8cf688e30f668cba5e5d79e907eb7f65bca2538ce927fddb42d74840036b,2433
+- original:
     git: https://github.com/0xCM/type-combinators.git
     commit: 58167dd4017b666ff592bb9493b0570a054aabdb
   completed:
