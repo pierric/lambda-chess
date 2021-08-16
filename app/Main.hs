@@ -44,16 +44,19 @@ playStep :: (HasCallStack,
             MonadIO m)
          => IOGenM g -> Int -> Int -> m (ConduitData m (NDArray Float, NDArray Float, Float))
 playStep randgen n_rollout step_index = do
-    logInfo . display $ sformat ("[Play " % int % "]") step_index
+    logInfo . display $ sformat ("[Play iter" % int % "]") step_index
     (cur, plys) <-
         if step_index < 10
-          then {-# SCC "play" #-} play succPositions (uniformlyChoose randgen) n_rollout
+          then play succPositions (uniformlyChoose randgen) threeFoldDraw n_rollout
           else do
               infr_sym <- runLayerBuilder (modelDef False)
               let inputs_shape = M.fromList [("inp", [1, 105, 8, 8])]
               askSession $ do
-                  withSharedParameters infr_sym inputs_shape $ \forward -> do
-                      play (succPositionsWithModel forward) (chooseByV randgen) n_rollout
+                  withSharedParameters infr_sym inputs_shape $ \forward ->
+                      play (succPositionsWithModel forward)
+                           (chooseByV randgen)
+                           threeFoldDraw
+                           n_rollout
     return $ ConduitData (Just 1) (encodeForTraining cur)
 
     where
@@ -171,7 +174,7 @@ main = do
 
         optm <- makeOptimizer SGD'Mom (Const 0.001) Nil
 
-        forM_ [0..1] $ \step -> do
+        forM_ [0..20] $ \step -> do
             dat <- playStep randgen 100 step
             trainStep optm (batchify 4 dat)
 

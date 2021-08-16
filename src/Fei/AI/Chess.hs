@@ -7,7 +7,8 @@
 module Fei.AI.Chess where
 
 import           Control.Applicative
-import           Control.Lens                 (each, enum, from, makeLenses)
+import           Control.Lens                 (_1, _2, each, enum, from,
+                                               makeLenses, use, (%=), (+=))
 import           Control.Monad                (replicateM)
 import           Control.Zipper
 import           Data.Bifunctor               (bimap)
@@ -22,10 +23,12 @@ import           RIO.List.Partial             (head, init, tail)
 import qualified RIO.NonEmpty                 as NE
 import qualified RIO.NonEmpty.Partial         as NE
 import           RIO.Partial                  (fromJust, toEnum)
+import           RIO.State
 import qualified RIO.Vector                   as V
 import qualified RIO.Vector.Partial           as V
 import qualified RIO.Vector.Storable          as VS
-import           RIO.Writer
+import           System.Console.ANSI          (cursorDownLine, cursorUpLine)
+import           System.IO                    (putStrLn)
 import           System.Random
 import           System.Random.MWC
 import           System.Random.Stateful       (IOGenM, newIOGenM, uniformRM)
@@ -75,7 +78,7 @@ succPositions (Cursor z) =
         | insufficientMaterial pos -> V.empty
         | otherwise -> let actions = legalPlies pos
                            makeChild a = (Node (BoardState (doPly pos a) (Just a)) 0 0 V.empty, ())
-                        in V.fromList $ map makeChild actions
+                        in V.fromList $! map makeChild actions
 
 uniformlyChoose :: (MonadIO m, RandomGen g)
                 => IOGenM g -> Choose m a v
@@ -101,6 +104,11 @@ reward (Win Black) = -1
 reward Draw        = 0
 reward Undecided   = error "the game should continue"
 
+threeFoldDraw :: Precondition BoardState
+threeFoldDraw cur = case checkRepetition (history cur) of
+                      EncodedRepetitions [_, 1] -> Just 0
+                      _                         -> Nothing
+
 -- | Ascend the traversal tree till the root to get a non-empty list of cursors that
 --   leads to the given cursor.
 history :: Cursor BoardState -> NonEmpty (Cursor BoardState)
@@ -125,21 +133,32 @@ getPosition (Cursor cur) = view (focus . node_v . board_position) cur
 play :: (HasCallStack, MonadIO m)
      => Succ m BoardState v
      -> Choose m BoardState v
+     -> Precondition BoardState
      -> Int
      -> m (Cursor BoardState, [Ply])
-play succ choose n_rollout = do
+play succ choose draw_policy n_rollout = do
     let cur = Cursor $ zipper $ Node (BoardState startpos Nothing) 0 0 V.empty
-    (!c, !p) <- runWriterT $ go cur
-    return (c, p)
+    liftIO $ putStrLn ""
+    (!c, (!p, _)) <- flip runStateT ([], 0) $ go cur
+    return (c, reverse p)
     where
         -- go :: Cursor BoardState -> WriterT [Ply] m (Cursor BoardState)
         go cur@(Cursor z) = do
-
             case z & view (focus . node_v . board_ply) of
-              Just ply -> tell [ply]
+              Just ply -> _1 %= (ply:)
               Nothing  -> return ()
 
-            next <- mcts (lift . succ) (lift . choose) (reward . judge) n_rollout cur
+            next <- mcts (lift . succ)
+                         (lift . choose)
+                         (reward . judge)
+                         draw_policy
+                         n_rollout
+                         cur
+
+            cnt <- use _2
+            liftIO $ cursorUpLine 1 >> putStrLn (show cnt)
+            _2 += 1
+
             case next of
               Nothing         -> return cur
               Just (sel, cur) -> go (childAt sel cur)

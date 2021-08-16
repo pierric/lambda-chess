@@ -29,6 +29,7 @@ dependencies:
 - mwc-random
 - constraints
 - conduit
+- ansi-terminal
 - fei-base >= 2 && < 3
 - fei-nn >= 2 && < 3
 

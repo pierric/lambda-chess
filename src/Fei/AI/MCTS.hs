@@ -21,10 +21,10 @@ cSCALAR = 1 / sqrt 2.0
 cEPSILON = 1e-4
 
 data Node a =
-    Node { _node_v        :: a
+    Node { _node_v        :: !a
          , _node_q        :: Float
          , _node_n        :: Int
-         , _node_children :: Vector (Node a)
+         , _node_children :: !(Vector (Node a))
          }
     deriving Show
 
@@ -33,6 +33,7 @@ makeLenses ''Node
 type Succ m a v = Cursor a -> m (Vector (Node a, v))
 type Choose m a v = Vector (Node a, v) -> m (Node a)
 type Judge a = a -> Float
+type Precondition a = Cursor a -> Maybe Float
 
 class UpwardeNavigable z a where
     type UpwardZipper z a
@@ -79,16 +80,25 @@ select c@(Cursor z)
     where
         cur_node = z & view focus
 
-simulate :: MonadIO m => Succ m a v -> Choose m a v -> Judge a -> Cursor a -> m Float
-simulate succ choose judge cur@(Cursor z) = go cur
+simulate :: MonadIO m
+         => Succ m a v
+         -> Choose m a v
+         -> Judge a
+         -> Precondition a
+         -> Cursor a
+         -> m Float
+simulate succ choose judge pre_cond cur@(Cursor z) = go cur
     where
         go cur@(Cursor z) = do
-            space <- succ cur
-            if null space
-              then return $ judge $ view (focus . node_v) z
-              else do
-                  n <- choose space
-                  go $ Cursor $ zipper n
+            case pre_cond cur of
+              Just outcome -> return outcome
+              Nothing -> do
+                  space <- succ cur
+                  if null space
+                    then return $ judge $ view (focus . node_v) z
+                    else do
+                        n <- choose space
+                        go $ Cursor $ zipper n
 
 backward :: Int -> Cursor a -> Float -> Cursor a
 backward n (Cursor z) reward =
@@ -102,9 +112,9 @@ backward n (Cursor z) reward =
                        Just (pz, Dict, Dict, Dict) -> backward (n-1) (Cursor pz) (-reward)
 
 mcts :: (HasCallStack, MonadIO m)
-     => Succ m a v -> Choose m a v -> Judge a
+     => Succ m a v -> Choose m a v -> Judge a -> Precondition a
      -> Int -> Cursor a -> m (Maybe (Int, Cursor a))
-mcts succ choose judge = go
+mcts succ choose judge pre_cond = go
     where
         expected_reward n = n ^. node_q / (fromIntegral (n ^. node_n) + cEPSILON)
         go 0 root@(Cursor z) = do
@@ -118,7 +128,7 @@ mcts succ choose judge = go
             (cur_at_leaf, path) <- runWriterT $ select root
 
             cur_expanded <- expand succ cur_at_leaf
-            reward <- simulate succ choose judge cur_expanded
+            reward <- simulate succ choose judge pre_cond cur_expanded
 
             let root_updated = backward (length path) cur_expanded reward
             go (n - 1) root_updated

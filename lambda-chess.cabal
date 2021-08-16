@@ -34,7 +34,8 @@ library
   default-extensions:
       NoImplicitPrelude
   build-depends:
-      base >=4.7 && <5
+      ansi-terminal
+    , base >=4.7 && <5
     , chessIO
     , conduit
     , constraints
@@ -57,7 +58,8 @@ executable lambda-chess-exe
       NoImplicitPrelude
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.7 && <5
+      ansi-terminal
+    , base >=4.7 && <5
     , chessIO
     , conduit
     , constraints
@@ -82,7 +84,8 @@ test-suite lambda-chess-test
       test
   ghc-options: -threaded -rtsopts -with-rtsopts=-N
   build-depends:
-      base >=4.7 && <5
+      ansi-terminal
+    , base >=4.7 && <5
     , chessIO
     , conduit
     , constraints
