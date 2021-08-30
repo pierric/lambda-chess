@@ -49,8 +49,10 @@ executables:
     dependencies:
     - lambda-chess
     - formatting
-    - vector-algorithms
+    - perfect-vector-shuffle
+    - binary
     - fei-nn >= 2 && < 3
+    - store
     default-extensions:
       NoImplicitPrelude
 

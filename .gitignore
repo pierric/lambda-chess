@@ -1,2 +1,10 @@
 .stack-work/
 *~
+*.ps
+*.hp
+*.prof
+*.eventlog
+prof*
+snapshots
+stack.yaml.lock
+lambda-chess.cabal
