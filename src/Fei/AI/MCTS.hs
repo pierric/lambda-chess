@@ -3,6 +3,7 @@
 {-# LANGUAGE GADTs                 #-}
 {-# LANGUAGE LambdaCase            #-}
 {-# LANGUAGE MultiParamTypeClasses #-}
+{-# LANGUAGE OverloadedStrings     #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeFamilies          #-}
 {-# LANGUAGE TypeOperators         #-}
@@ -11,10 +12,12 @@ module Fei.AI.MCTS where
 import           Control.Lens       (makeLenses, (+~))
 import           Control.Zipper
 import           Data.Constraint
+import           Data.Monoid        (First (..))
 import           RIO
+import           RIO.State
 import qualified RIO.Vector         as V
 import qualified RIO.Vector.Partial as V
-import           RIO.Writer
+
 
 cSCALAR, cEPSILON :: Float
 cSCALAR = 1 / sqrt 2.0
@@ -34,6 +37,13 @@ type Succ m a v = Cursor a -> m (Vector (Node a, v))
 type Choose m a v = Vector (Node a, v) -> m (Node a)
 type Judge a = a -> Float
 type Precondition a = Cursor a -> Maybe Float
+
+(<||>) :: Precondition a -> Precondition a -> Precondition a
+cond1 <||> cond2 = \c -> let v1 = cond1 c :: Maybe Float
+                             v2 = cond2 c :: Maybe Float
+                          in v1 <|> v2
+
+-- fmap getFirst . ((fmap First . cond1) <> (fmap First . cond2))
 
 class UpwardeNavigable z a where
     type UpwardZipper z a
@@ -69,18 +79,18 @@ expand succ cur@(Cursor z) = do
     children <- succ cur <&> V.map fst
     return $ Cursor $ z & focus . node_children %~ (V.++ children)
 
-select :: (HasCallStack, Monad m) => Cursor a -> WriterT [Int] m (Cursor a)
+select :: (HasCallStack, Monad m) => Cursor a -> StateT Int m (Cursor a)
 select c@(Cursor z)
   | V.null (cur_node ^. node_children) = return c
   | otherwise = do
       let logn = log $ fromIntegral (cur_node ^. node_n) + cEPSILON
           choice = V.maxIndex $ V.map (uct logn) $ cur_node ^. node_children
-      tell [choice]
+      modify (+1)
       select (childAt choice c)
     where
         cur_node = z & view focus
 
-simulate :: MonadIO m
+simulate :: (MonadIO m, Show a)
          => Succ m a v
          -> Choose m a v
          -> Judge a
@@ -111,7 +121,7 @@ backward n (Cursor z) reward =
                        Nothing -> error "the backward pass goes beyond the root"
                        Just (pz, Dict, Dict, Dict) -> backward (n-1) (Cursor pz) (-reward)
 
-mcts :: (HasCallStack, MonadIO m)
+mcts :: (HasCallStack, MonadIO m, Show a)
      => Succ m a v -> Choose m a v -> Judge a -> Precondition a
      -> Int -> Cursor a -> m (Maybe (Int, Cursor a))
 mcts succ choose judge pre_cond = go
@@ -125,11 +135,17 @@ mcts succ choose judge pre_cond = go
                 let best = V.maxIndex $ V.map expected_reward children
                 return $ Just (best, root)
         go n root = do
-            (cur_at_leaf, path) <- runWriterT $ select root
+            (cur_at_leaf, path_length) <- flip runStateT 0 $ select root
 
-            cur_expanded <- expand succ cur_at_leaf
-            reward <- simulate succ choose judge pre_cond cur_expanded
+            -- once we selected a path that not satifying pre_cond,
+            -- we wouldn't update the q/n any more. Therefore it can simply
+            -- jumps to the final loop step.
+            case pre_cond cur_at_leaf of
+              Just _  -> go 0 root
+              Nothing -> do
+                cur_expanded <- expand succ cur_at_leaf
+                reward <- simulate succ choose judge pre_cond cur_expanded
 
-            let root_updated = backward (length path) cur_expanded reward
-            go (n - 1) root_updated
+                let root_updated = backward path_length cur_expanded reward
+                go (n - 1) root_updated
 
