@@ -51,8 +51,9 @@ executables:
     - formatting
     - perfect-vector-shuffle
     - binary
-    - fei-nn >= 2 && < 3
     - store
+    - yaml
+    - fei-nn >= 2 && < 3
     default-extensions:
       NoImplicitPrelude
 

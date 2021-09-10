@@ -62,10 +62,13 @@ newtype EncodedRepetitions = EncodedRepetitions [Int]
 
 data BoardState = BoardState
     { _board_position :: !Position
-    , _board_ply      :: Maybe Ply
+    , _board_ply      :: !(Maybe Ply)
     }
     deriving Show
 makeLenses ''BoardState
+
+instance NFData BoardState where
+    rnf (BoardState !pos !ply) = ()
 
 cNumLookBack :: Int
 cNumLookBack = 7
@@ -79,18 +82,17 @@ draw pos = insufficientMaterial pos || stalemate pos
 
 succPositions :: (HasCallStack, MonadIO m) => Succ m BoardState ()
 succPositions (Cursor z) =
-    return $ case view (focus . node_v) z of
+    return $!! case z & view (focus . node_v) of
       BoardState pos _
         | insufficientMaterial pos -> V.empty
-        | otherwise -> let actions = legalPlies pos
-                           makeChild a = (Node (BoardState (doPly pos a) (Just a)) 0 0 V.empty, ())
-                        in V.fromList $! map makeChild actions
+        | otherwise ->
+            let actions = V.indexed $ V.fromList $ legalPlies pos
+                makeChild (i, a) = (Node (BoardState (doPly pos a) (Just a)) i 0 0 V.empty, ())
+             in V.map makeChild actions
 
 uniformlyChoose :: (MonadIO m, RandomGen g)
                 => IOGenM g -> Choose m a v
-uniformlyChoose gen options = do
-    a <- uniformRM (0, V.length options - 1) gen
-    return $ fst $ options V.! a
+uniformlyChoose gen options = uniformRM (0, V.length options - 1) gen
 
 data Outcome = Win Color
              | Draw
@@ -112,38 +114,33 @@ reward Undecided   = error "the game should continue"
 
 threeFoldDraw :: HasCallStack => Maybe Int -> Precondition BoardState
 threeFoldDraw n_lookback cur =
-    case checkRepetition (lastN n_lookback $ history cur) of
+    case checkRepetition (history n_lookback cur) of
       EncodedRepetitions [_, 1] -> Just (reward Draw)
       _                         -> Nothing
-    where
-        lastN Nothing  a = a
-        lastN (Just n) a = case NE.nonEmpty $ NE.drop (length a - n) a of
-                             Just b  -> b
-                             Nothing -> error "bad n_lookback, resulting in empty history to check 3-fold repetitions"
 
 noProgressDraw :: HasCallStack => Int -> Precondition BoardState
 noProgressDraw n_half_moves (Cursor z)
     | hm >= n_half_moves = Just (reward Draw)
     | otherwise = Nothing
     where
-    pos = z & view (focus . node_v . board_position)
-    hm  = halfMoveClock pos
+    node = view (focus . node_v) z
+    hm = node ^. board_position & halfMoveClock
 
 fiftyMovesDraw = noProgressDraw 100
 seventyFiveMovesDraw = noProgressDraw 150
 
 -- | Ascend the traversal tree till the root to get a non-empty list of cursors that
 --   leads to the given cursor.
-history :: Cursor BoardState -> NonEmpty (Cursor BoardState)
-history c = walk (c NE.:| []) c
+history :: Maybe Int -> Cursor BoardState -> NonEmpty (Cursor BoardState)
+history cnt c = walk (c NE.:| []) cnt c
     where
-        walk :: NonEmpty (Cursor BoardState) -> Cursor BoardState -> NonEmpty (Cursor BoardState)
-        walk hist c@(Cursor z) =
-            let pos = z & view (focus . node_v . board_position)
-             in case parent z of
-                  Nothing                     -> hist
-                  Just (pz, Dict, Dict, Dict) -> let c = Cursor pz
-                                                  in walk (c NE.<| hist) c
+        walk :: NonEmpty (Cursor BoardState) -> Maybe Int -> Cursor BoardState -> NonEmpty (Cursor BoardState)
+        walk hist (Just 0) _ = hist
+        walk hist cnt c@(Cursor !z) =
+             case parent z of
+               Nothing         -> hist
+               Just (pz, Dict) -> let pc = Cursor pz
+                                   in walk (pc NE.<| hist) (cnt <&> subtract 1) pc
 
 -- | Get the board for the given cursor
 getPosition :: Cursor BoardState -> Position
@@ -154,19 +151,20 @@ getPosition (Cursor cur) = view (focus . node_v . board_position) cur
 --
 --   Returns the final cusor and full list of play steps.
 play :: (HasCallStack, MonadIO m)
-     => Succ m BoardState v
+     => Root BoardState
+     -> Succ m BoardState v
      -> Choose m BoardState v
      -> Precondition BoardState
      -> Int
      -> m (Cursor BoardState, [Ply])
-play succ choose draw_policy n_rollout = do
-    let cur = Cursor $ zipper $ Node (BoardState startpos Nothing) 0 0 V.empty
+play root succ choose draw_policy n_rollout = do
+    -- let cur = Cursor $ zipper $ Node (BoardState startpos Nothing) 0 0 V.empty
     liftIO $ putStrLn ""
-    (!c, (!p, _)) <- flip runStateT ([], 0) $ go cur
+    (!c, (!p, _)) <- flip runStateT ([], 0) $ go (Cursor root)
     return (c, reverse p)
     where
         -- go :: Cursor BoardState -> WriterT [Ply] m (Cursor BoardState)
-        go cur@(Cursor z) = do
+        go cur@(Cursor !z) = do
             case z & view (focus . node_v . board_ply) of
               Just ply -> _1 %= (ply:)
               Nothing  -> return ()
@@ -183,8 +181,13 @@ play succ choose draw_policy n_rollout = do
             _2 += 1
 
             case next of
-              Nothing         -> return cur
-              Just (sel, cur) -> go (childAt sel cur)
+              Nothing               -> return cur
+              Just (sel, Cursor nz) -> do
+                -- let bp = z  & view (focus . node_v . board_position)
+                --     op = z  & view (focus . node_v . board_ply) <&> toUCI
+                --     np = nz & view (focus . node_v . board_ply) <&> toUCI
+                -- traceShowM ("      ", bp, sel, op, np)
+                go $ Cursor $ childAt sel nz
 
 -- | Calculate the square after swapping the W/B plays.
 rotateSquare :: (Rank, File) -> (Rank, File)
@@ -401,7 +404,7 @@ _buildGt replay outcome cxt = do
 encodeForInference :: (HasCallStack, MonadIO m)
                    => Cursor BoardState -> Context -> m (NDArray Float)
 encodeForInference c@(Cursor z) cxt = liftIO $ do
-    let replay_full = history c
+    let replay_full = history Nothing c
         -- check the 2/3 repetition status at each past step
         replay_each_step  = stepwise replay_full
         repetition_status = NE.map checkRepetition replay_each_step
@@ -419,7 +422,7 @@ encodeForTraining c@(Cursor z) = C.sourceList steps C..| C.mapM buildEach
                     other     -> other
         -- dropping the last step, and make replays (from step 0 to n) at each step
         -- Note: for a finished game, the length is guaranteed to be > 1
-        replay_each_step = stepwise $ NE.fromList $ NE.init $ history c
+        replay_each_step = stepwise $ NE.fromList $ NE.init $ history Nothing c
         -- check the 2/3 repetition status of each replay
         repetition_status = NE.map checkRepetition replay_each_step
         -- glue boardstate, repetition, outcome together and for further building

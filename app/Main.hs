@@ -1,3 +1,4 @@
+{-# LANGUAGE BangPatterns      #-}
 {-# LANGUAGE DataKinds         #-}
 {-# LANGUAGE FlexibleContexts  #-}
 {-# LANGUAGE GADTs             #-}
@@ -6,22 +7,26 @@
 {-# LANGUAGE TypeApplications  #-}
 module Main where
 
-import           Control.Lens                 (ix, use, (^?!))
+import           Control.Lens                 (_2, ix, use, (^?!))
+import           Control.Zipper               (rezip, zipper)
 import qualified Data.Binary                  as Binary (encodeFile)
 import qualified Data.Conduit                 as C (runConduit, (.|))
 import qualified Data.Conduit.Combinators     as C (sinkFile)
 import qualified Data.Conduit.List            as C (chunksOf, map, mapM)
 import qualified Data.Store                   as Store
+import qualified Data.Yaml                    as Yaml
 import           Formatting                   (formatToString, int, sformat,
                                                stext, (%))
 import           GHC.TypeLits                 (KnownSymbol)
-import           Game.Chess                   (Ply, color, opponent)
+import           Game.Chess                   (Ply, color, opponent, startpos,
+                                               toUCI)
 import           RIO                          hiding (Const)
 import           RIO.Directory                (createDirectoryIfMissing)
 import           RIO.FilePath                 ((</>))
 import qualified RIO.HashMap                  as M
 import qualified RIO.HashSet                  as S
 import           RIO.List                     (unzip3)
+import qualified RIO.State                    as ST
 import qualified RIO.Vector.Boxed             as VB
 import qualified RIO.Vector.Boxed.Partial     as VB (head)
 import qualified RIO.Vector.Boxed.Unsafe      as VB
@@ -54,31 +59,38 @@ playStep :: (HasCallStack,
             HasSessionRef env (TaggedModuleState Float t),
             Session sess (TaggedModuleState Float t),
             MonadIO m)
-         => IOGenM g -> Int -> Int -> m ([Ply], ConduitData m (NDArray Float, NDArray Float, Float))
-playStep randgen n_rollout step_index = do
+         => IOGenM g
+         -> Int
+         -> Int
+         -> Root BoardState
+         -> m (Root BoardState, [Ply], ConduitData m (NDArray Float, NDArray Float, Float))
+playStep randgen n_rollout step_index root = do
     logInfo . display $ sformat ("[Play iter " % int % "]") step_index
 
     -- liftIO $ setConfig (#filename := "/mnt/hdd0/all.prof" .& #profile_all := True
     --                  .& #aggregate_stats := True .& Nil)
 
     (cur, plys) <-
-            if step_index < 10
-          then play succPositions (uniformlyChoose randgen) checkDraw n_rollout
+            if step_index < 0
+          then play root succPositions (uniformlyChoose randgen) checkDraw n_rollout
           else do
               infr_sym <- runLayerBuilder (modelDef False)
               let inputs_shape = M.fromList [("inp", cINPUTSHAPE)]
               askSession $ do
                   withSharedParameters infr_sym inputs_shape $ \forward ->
-                      play (succPositionsWithModel randgen forward)
+                      play root
+                           (succPositionsWithModel randgen forward)
                            (chooseByV randgen)
                            checkDraw
                            n_rollout
 
     -- liftIO (stats False Table Total Descending) >>= logInfo . display
-    return $ (plys, ConduitData (Just 1) (encodeForTraining cur))
+    let root_new = case cur of Cursor z -> zipper $ force $ rezip z
+    return (root_new, plys, ConduitData (Just 1) (encodeForTraining cur))
 
     where
-    checkDraw = threeFoldDraw (Just 200) <||> fiftyMovesDraw
+    {-# SCC checkDraw #-}
+    checkDraw = threeFoldDraw (Just 100) <||> fiftyMovesDraw
     --checkDraw = threeFoldDraw (Just 200)
     --checkDraw = fiftyMovesDraw
 
@@ -89,63 +101,70 @@ playStep randgen n_rollout step_index = do
                            -> Cursor BoardState
                            -> m (VB.Vector (Node BoardState, Float))
     succPositionsWithModel randgen forward cur = liftIO $ do
-        -- make prediction
-        input  <- encodeForInference cur contextPinnedCPU >>= F.expandDims 0
-        output <- forward $ M.fromList [("inp", input)]
-
-        distr_logits <- F.squeeze Nothing $ output ^?! ix 0
-        distr_logits <- toCPU distr_logits
-
-        let enc (node, _) = let pos  = node ^. node_v . board_position
-                                -- the ply was done in prior to the node (i.e. the opponent)
-                                cur_color = opponent $ color pos
-                                mply = node ^. node_v . board_ply
-                             in case mply >>= encodePly cur_color of
-                                  Just plyidx -> fromIntegral plyidx
-                                  Nothing     -> error $ "cannot encode the Ply: " ++ show mply
-
         -- get allowed Ply from all_pos
         all_pos     <- succPositions cur
 
         if VB.null all_pos then
             return VB.empty
         else do
-            all_pos     <- applyIOGen (shuffle all_pos) randgen
-            all_pos_enc <- makeNDArray [VB.length all_pos] contextCPU $ VS.convert $ VB.map enc all_pos
+            mc <- randomRM (0 :: Int, 9) randgen
+            if mc > 2 then
+                return $ VB.map (_2 .~ 0) all_pos
+            else do
+                -- make prediction
+                input  <- encodeForInference cur contextPinnedCPU >>= F.expandDims 0
+                output <- forward $ M.fromList [("inp", input)]
 
-            -- -- look them up in the predicated distribution logits
-            -- -- return all options
-            -- distr_logits_valid <- F.takeI all_pos_enc distr_logits >>= toVector
-            -- return $ VB.zip (VB.unzip all_pos & fst) (VB.convert distr_logits_valid)
+                distr_logits <- F.squeeze Nothing $ output ^?! ix 0
+                -- distr_logits <- toCPU distr_logits
 
-            -- -- take the best k options
-            -- distr_logits_valid <- F.takeI all_pos_enc distr_logits
-            -- let k = min 10 (VB.length all_pos)
-            -- (values, indices) <- F.topkBoth (Just 0) k distr_logits_valid
-            -- indices <- VB.convert <$> toVector indices
-            -- values  <- VB.convert <$> toVector values
-            -- let nodes = VB.unzip all_pos & fst
-            --     nodes_k = VB.map (\i -> nodes ^?! ix (truncate i)) indices
-            -- return $ VB.zip nodes_k values
+                let enc (node, _) = let pos  = node ^. node_v . board_position
+                                        -- the ply was done in prior to the node (i.e. the opponent)
+                                        cur_color = opponent $ color pos
+                                        mply = node ^. node_v . board_ply
+                                     in case mply >>= encodePly cur_color of
+                                          Just plyidx -> fromIntegral plyidx
+                                          Nothing     -> error $ "cannot encode the Ply: " ++ show mply
 
-            -- return the best option
-            distr_logits_valid <- F.takeI all_pos_enc distr_logits
-            index <- F.argmax distr_logits_valid Nothing False
-            index <- VS.head <$> toVector index
-            -- value <- distr_logits_valid !* index
-            -- value <- VS.head <$> toVector value
-            return $ VB.singleton (all_pos ^?! ix (fromIntegral index) & fst, 0)
+                all_pos     <- applyIOGen (shuffle all_pos) randgen
+                let device = contextGPU0 -- contextCPU
+                all_pos_enc <- makeNDArray [VB.length all_pos] device $ VS.convert $ VB.map enc all_pos
+
+                -- -- look them up in the predicated distribution logits
+                -- -- return all options
+                -- distr_logits_valid <- F.takeI all_pos_enc distr_logits >>= toVector
+                -- return $ VB.zip (VB.unzip all_pos & fst) (VB.convert distr_logits_valid)
+
+                -- -- take the best k options
+                -- distr_logits_valid <- F.takeI all_pos_enc distr_logits
+                -- let k = min 10 (VB.length all_pos)
+                -- (values, indices) <- F.topkBoth (Just 0) k distr_logits_valid
+                -- indices <- VB.convert <$> toVector indices
+                -- values  <- VB.convert <$> toVector values
+                -- let nodes = VB.unzip all_pos & fst
+                --     nodes_k = VB.map (\i -> nodes ^?! ix (truncate i)) indices
+                -- return $ VB.zip nodes_k values
+
+                -- return the best option. The value is set to dummy 0, since there is only one option
+                distr_logits_valid <- F.takeI all_pos_enc distr_logits
+
+                index <- F.argmax distr_logits_valid (Just 0) False >>= toScalar
+
+                let choice = all_pos ^?! ix (fromIntegral index) & fst & node_i .~ 0
+                return $ VB.singleton (choice, 0)
 
     {-# SCC chooseByV #-}
     chooseByV :: (MonadIO m, RandomGen g)
               => IOGenM g
-              -> VB.Vector (Node BoardState, Float)
-              -> m (Node BoardState)
-    chooseByV randgen options = liftIO $ do
+              -> Choose m BoardState Float
+    chooseByV randgen options =
         -- take the all nodes with maximum v
         -- random choose one from them
         --
-        return $ fst $ VB.head options
+        if VB.length options > 1 then
+            uniformlyChoose randgen options
+        else
+            return 0
 
         -- options <- VB.unsafeThaw options
         -- VB.sortBy (flip compare `on` snd) options
@@ -279,10 +298,10 @@ saveSnapshot :: (HasCallStack,
              => Int -> [Ply] -> m ()
 saveSnapshot step plys = do
     let dir = "snapshots"
-        play_file  = formatToString ("play_"  % int % ".bin")   step
+        play_file  = formatToString ("play_"  % int % ".yaml")   step
         model_file = formatToString ("model_" % int % ".state") step
     createDirectoryIfMissing False dir
-    liftIO $ Binary.encodeFile (dir </> play_file) plys
+    liftIO $ Yaml.encodeFile (dir </> play_file) (map toUCI plys)
     askSession $ saveState (step == 0) (dir </> model_file)
 
 main = do
@@ -301,16 +320,24 @@ main = do
             _cfg_fixed_params = S.fromList [],
             _cfg_context = contextGPU0 })
 
+        logInfo "load weights"
+        askSession $ loadState "snapshots/weights" ["inp", "distr", "outcome"]
+
         optm <- makeOptimizer SGD'Mom (Const 0.001) Nil
 
-        forM_ [0..100] $ \step -> do
-            (plys, dat) <- playStep randgen cROLLOUT step
-            trainStep optm (batchify cTRAINBATCHSIZE dat)
-            saveSnapshot step plys
-            -- ConduitData _ cc <- playStep randgen 100 step
-            -- let name = formatToString ("data." % int % ".binary") step
-            --     sink = C.sinkFile name
-            -- C.runConduit $ cc C..| C.map Store.encode C..| sink
+        let root = zipper $ Node (BoardState startpos Nothing) 0 0 0 VB.empty
+        void $ flip ST.evalStateT root $ do
+            forM_ [0..100] $ \step -> do
+                cur <- ST.get
+                (!cur, plys, dat) <- lift $ playStep randgen cROLLOUT step cur
+                ST.put cur
+                lift $ trainStep optm (batchify cTRAINBATCHSIZE dat)
+                lift $ saveSnapshot step plys
+                -- -- dump the dataset for debug
+                -- ConduitData _ cc <- playStep randgen 100 step
+                -- let name = formatToString ("data." % int % ".binary") step
+                --     sink = C.sinkFile name
+                -- C.runConduit $ cc C..| C.map Store.encode C..| sink
 
     where
         default_initializer :: I.CustomInit Float
