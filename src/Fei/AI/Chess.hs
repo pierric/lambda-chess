@@ -22,7 +22,8 @@ import qualified Data.Conduit.List            as C (mapM, sourceList)
 import           Data.Constraint              (Dict (..), (:-) (..))
 import           Game.Chess
 import           RIO
-import           RIO.List                     (inits, repeat, scanr, unzip)
+import           RIO.List                     (inits, repeat, scanr, unzip,
+                                               zip3)
 import           RIO.List.Partial             (head, init, tail)
 import qualified RIO.NonEmpty                 as NE
 import qualified RIO.NonEmpty.Partial         as NE
@@ -31,6 +32,7 @@ import           RIO.State
 import qualified RIO.Vector                   as V
 import qualified RIO.Vector.Partial           as V
 import qualified RIO.Vector.Storable          as VS
+import qualified RIO.Vector.Unboxed           as VU
 import           System.Console.ANSI          (cursorDownLine, cursorUpLine)
 import           System.IO                    (putStr, putStrLn)
 import           System.Random
@@ -74,9 +76,9 @@ cNumLookBack :: Int
 cNumLookBack = 7
 
 checkmate, stalemate, draw :: Position -> Bool
-checkmate pos = null (legalPlies pos) && inCheck (color pos) pos
+checkmate pos = VU.null (legalPlies' pos) && inCheck (color pos) pos
 
-stalemate pos = null (legalPlies pos) && not (inCheck (color pos) pos)
+stalemate pos = VU.null (legalPlies' pos) && not (inCheck (color pos) pos)
 
 draw pos = insufficientMaterial pos || stalemate pos
 
@@ -86,8 +88,10 @@ succPositions (Cursor z) =
       BoardState pos _
         | insufficientMaterial pos -> V.empty
         | otherwise ->
-            let actions = V.indexed $ V.fromList $ legalPlies pos
-                makeChild (i, a) = (Node (BoardState (doPly pos a) (Just a)) i 0 0 V.empty, ())
+            let actions = V.indexed $ V.convert $ legalPlies' pos
+                makeChild (i, a) = let v = BoardState (unsafeDoPly pos a) (Just $! a)
+                                       n = Node v i 0 0 V.empty
+                                    in n `seq` (n, ())
              in V.map makeChild actions
 
 uniformlyChoose :: (MonadIO m, RandomGen g)
@@ -131,16 +135,17 @@ seventyFiveMovesDraw = noProgressDraw 150
 
 -- | Ascend the traversal tree till the root to get a non-empty list of cursors that
 --   leads to the given cursor.
-history :: Maybe Int -> Cursor BoardState -> NonEmpty (Cursor BoardState)
-history cnt c = walk (c NE.:| []) cnt c
+history :: Maybe Int -> Cursor BoardState -> NonEmpty Position
+history cnt c = walk (getPosition c NE.:| []) cnt c
     where
-        walk :: NonEmpty (Cursor BoardState) -> Maybe Int -> Cursor BoardState -> NonEmpty (Cursor BoardState)
+        walk :: NonEmpty Position -> Maybe Int -> Cursor BoardState -> NonEmpty Position
         walk hist (Just 0) _ = hist
         walk hist cnt c@(Cursor !z) =
              case parent z of
                Nothing         -> hist
-               Just (pz, Dict) -> let pc = Cursor pz
-                                   in walk (pc NE.<| hist) (cnt <&> subtract 1) pc
+               Just (pz, Dict) -> let pc  = Cursor pz
+                                      !pp = getPosition pc
+                                   in walk (pp NE.<| hist) (cnt <&> subtract 1) pc
 
 -- | Get the board for the given cursor
 getPosition :: Cursor BoardState -> Position
@@ -305,27 +310,24 @@ encodeBoardPieces pos = EncodedPieces $ mapMaybe read_square [minBound..maxBound
              in (rank, file, fromEnum piece_type + offset)
 
 -- | Encode the repetition status
-checkRepetition :: NonEmpty (Cursor BoardState) -> EncodedRepetitions
-checkRepetition = checkAndEncode . NE.map getPosition
-    where
-    checkAndEncode hist@(last NE.:| _) =
-        let count = length $ NE.filter (== last) hist
-            rept2 = fromEnum (count == 2)
-            rept3 = fromEnum (count == 3)
-         in EncodedRepetitions [rept2, rept3]
+checkRepetition :: NonEmpty Position -> EncodedRepetitions
+checkRepetition hist@(last NE.:| _) =
+    let count = length $ NE.filter (== last) hist
+        rept2 = fromEnum (count == 2)
+        rept3 = fromEnum (count == 3)
+     in EncodedRepetitions [rept2, rept3]
 
 -- tail of inits guarantees to be NonEmpty if any
 stepwise :: NonEmpty a -> NonEmpty (NonEmpty a)
 stepwise = NE.map NE.fromList . NE.fromList . NE.tail . NE.inits
 
-_buildInp :: NonEmpty (Cursor BoardState) -> NonEmpty EncodedRepetitions -> Context -> IO (NDArray Float)
+_buildInp :: NonEmpty Position -> NonEmpty EncodedRepetitions -> Context -> IO (NDArray Float)
 _buildInp replay reps_enc cxt = do
     -- encode the following
     -- + meta
     -- + pieces
     -- + 2/3 repetition
-    let rev_cur@(last_cur NE.:| _) = NE.reverse replay
-        rev_pos@(last_pos NE.:| _) = NE.map getPosition rev_cur
+    let rev_pos@(last_pos NE.:| _) = NE.reverse replay
         color_   = color last_pos
 
         meta :: [Float]
@@ -372,10 +374,9 @@ _buildInp replay reps_enc cxt = do
         rotateIfBlack Black = rotateEncodedPieces
 
 
-_buildGt :: NonEmpty (Cursor BoardState) -> Outcome -> Context -> IO (NDArray Float, Float)
-_buildGt replay outcome cxt = do
-    let rev_cur@(last_cur NE.:| _) = NE.reverse replay
-        rev_pos@(last_pos NE.:| _) = NE.map getPosition rev_cur
+_buildGt :: NonEmpty Position -> Vector (Node BoardState) -> Outcome -> Context -> IO (NDArray Float, Float)
+_buildGt replay children outcome cxt = do
+    let rev_pos@(last_pos NE.:| _) = NE.reverse replay
         color_   = color last_pos
         count s  = let a = fromJust $ s ^. node_v . board_ply
                        n = s ^. node_n
@@ -387,9 +388,7 @@ _buildGt replay outcome cxt = do
                     in V.zip as' cs'
 
         actions :: Vector ([Int], Float)
-        actions  = let pos = case last_cur of
-                               Cursor z -> z & view (focus . node_children)
-                    in norm $ V.map count pos
+        actions  = norm $ V.map count children
 
     -- pi : (4672,)
     pi    <- scatter cxt [4672] $ V.toList actions
@@ -425,12 +424,22 @@ encodeForTraining c@(Cursor z) = C.sourceList steps C..| C.mapM buildEach
         replay_each_step = stepwise $ NE.fromList $ NE.init $ history Nothing c
         -- check the 2/3 repetition status of each replay
         repetition_status = NE.map checkRepetition replay_each_step
+
+        -- the action space at each step (excluding the last)
+        action_spaces = go []
+            where
+                go :: [Vector (Node a)] -> Cursor a-> [Vector (Node a)]
+                go acc (Cursor z) = case parent z of
+                                      Nothing -> acc
+                                      Just (pz, Dict) -> go (view (focus . node_children) pz : acc) (Cursor pz)
+
         -- glue boardstate, repetition, outcome together and for further building
-        steps = zip (NE.toList replay_each_step)
-                    (NE.toList $ stepwise repetition_status)
-        buildEach (replay, rept) = liftIO $ do
+        steps = zip3 (NE.toList replay_each_step)
+                     (action_spaces c)
+                     (NE.toList $ stepwise repetition_status)
+        buildEach (replay, action_space, rept) = liftIO $ do
            !inp <- _buildInp replay rept contextCPU
-           (!distr, !outcome') <- _buildGt replay outcome contextCPU
+           (!distr, !outcome') <- _buildGt replay action_space outcome contextCPU
            return (inp, distr, outcome')
 
 ravel :: [Int] -> [Int] -> Int

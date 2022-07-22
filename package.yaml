@@ -1,10 +1,10 @@
 name:                lambda-chess
 version:             0.1.0.0
-github:              "githubuser/lambda-chess"
+github:              "pierric/lambda-chess"
 license:             BSD3
-author:              "Author name here"
-maintainer:          "example@example.com"
-copyright:           "2021 Author name here"
+author:              "Jiasen Wu"
+maintainer:          "jiasenwu@hotmail.com"
+copyright:           "2022 Jiasen Wu"
 
 extra-source-files:
 - README.md
@@ -21,7 +21,7 @@ description:         Please see the README on GitHub at <https://github.com/gith
 
 dependencies:
 - base >= 4.7 && < 5
-- chessIO
+- chessIO >= 0.9.1.0
 - lens
 - zippers
 - rio
