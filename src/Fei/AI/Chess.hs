@@ -8,6 +8,7 @@
 {-# LANGUAGE StandaloneDeriving    #-}
 {-# LANGUAGE TemplateHaskell       #-}
 {-# LANGUAGE TypeApplications      #-}
+{-# OPTIONS_GHC -fplugin=Data.Record.Anon.Plugin #-}
 module Fei.AI.Chess where
 
 import           Control.Applicative
@@ -40,7 +41,8 @@ import           System.Random.MWC
 import           System.Random.Stateful       (IOGenM, newIOGenM, uniformRM)
 
 import           Fei.AI.MCTS
-import           MXNet.Base
+import           MXNet.Base hiding (Enum)
+import           MXNet.Base.Tensor (prim)
 import qualified MXNet.Base.Operators.Tensor  as T
 import qualified MXNet.Base.Tensor.Functional as F
 
@@ -64,6 +66,7 @@ newtype EncodedRepetitions = EncodedRepetitions [Int]
 
 data BoardState = BoardState
     { _board_position :: !Position
+    -- , _board_succ_positions -- cache all possible next play
     , _board_ply      :: !(Maybe Ply)
     }
     deriving Show
@@ -82,16 +85,16 @@ stalemate pos = VU.null (legalPlies' pos) && not (inCheck (color pos) pos)
 
 draw pos = insufficientMaterial pos || stalemate pos
 
-succPositions :: (HasCallStack, MonadIO m) => Succ m BoardState ()
+succPositions :: (HasCallStack, MonadIO m, Num v) => Succ m BoardState v
 succPositions (Cursor z) =
-    return $!! case z & view (focus . node_v) of
+    return $ case z & view (focus . node_v) of
       BoardState pos _
         | insufficientMaterial pos -> V.empty
         | otherwise ->
             let actions = V.indexed $ V.convert $ legalPlies' pos
                 makeChild (i, a) = let v = BoardState (unsafeDoPly pos a) (Just $! a)
                                        n = Node v i 0 0 V.empty
-                                    in n `seq` (n, ())
+                                    in n `seq` (n, 0)
              in V.map makeChild actions
 
 uniformlyChoose :: (MonadIO m, RandomGen g)
@@ -482,4 +485,4 @@ ndZerosWithContext cxt shape =
     case enumWeaken @NumericDTypes @AllDTypes @(DTypeName a) of
       Sub Dict ->
         let dtype = EnumType $ typename (undefined :: a)
-         in prim T.__zeros (#ctx := tshow cxt .& #dtype := dtype .& #shape := shape .& Nil)
+         in prim T.__zeros (ANON { ctx = Just (tshow cxt), dtype = Just dtype, shape = Just shape })

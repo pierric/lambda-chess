@@ -30,8 +30,9 @@ dependencies:
 - constraints
 - conduit
 - ansi-terminal
+- large-anon
+- data-default-class
 - fei-base >= 2 && < 3
-- fei-nn >= 2 && < 3
 
 library:
   source-dirs: src
@@ -53,7 +54,7 @@ executables:
     - binary
     - store
     - yaml
-    - fei-nn >= 2 && < 3
+    - unordered-containers
     default-extensions:
       NoImplicitPrelude
 
