@@ -41,9 +41,9 @@ import           System.Random.MWC
 import           System.Random.Stateful       (IOGenM, newIOGenM, uniformRM)
 
 import           Fei.AI.MCTS
-import           MXNet.Base hiding (Enum)
-import           MXNet.Base.Tensor (prim)
+import           MXNet.Base                   hiding (Enum)
 import qualified MXNet.Base.Operators.Tensor  as T
+import           MXNet.Base.Tensor            (prim)
 import qualified MXNet.Base.Tensor.Functional as F
 
 instance Enum PieceType where

@@ -1,12 +1,12 @@
-{-# LANGUAGE ImplicitParams #-}
-{-# LANGUAGE BangPatterns      #-}
-{-# LANGUAGE DataKinds         #-}
-{-# LANGUAGE FlexibleContexts  #-}
-{-# LANGUAGE GADTs             #-}
-{-# LANGUAGE OverloadedLabels  #-}
-{-# LANGUAGE OverloadedStrings #-}
-{-# LANGUAGE TypeApplications  #-}
-{-# LANGUAGE TypeFamilies      #-}
+{-# LANGUAGE BangPatterns         #-}
+{-# LANGUAGE DataKinds            #-}
+{-# LANGUAGE FlexibleContexts     #-}
+{-# LANGUAGE GADTs                #-}
+{-# LANGUAGE ImplicitParams       #-}
+{-# LANGUAGE OverloadedLabels     #-}
+{-# LANGUAGE OverloadedStrings    #-}
+{-# LANGUAGE TypeApplications     #-}
+{-# LANGUAGE TypeFamilies         #-}
 {-# LANGUAGE UndecidableInstances #-}
 {-# OPTIONS_GHC -fplugin=Data.Record.Anon.Plugin#-}
 module Main where
@@ -17,22 +17,23 @@ import qualified Data.Binary                  as Binary (encodeFile)
 import qualified Data.Conduit                 as C (runConduit, (.|))
 import qualified Data.Conduit.Combinators     as C (sinkFile)
 import qualified Data.Conduit.List            as C (chunksOf, map, mapM)
-import qualified Data.Store                   as Store
-import qualified Data.Yaml                    as Yaml
 import           Data.Default.Class
 import qualified Data.HashMap.Strict          as M
 import           Data.Record.Anon.Simple      (empty)
+import qualified Data.Store                   as Store
+import qualified Data.Yaml                    as Yaml
 import           Formatting                   (formatToString, int, sformat,
                                                stext, (%))
 import           GHC.TypeLits                 (KnownSymbol)
 import           Game.Chess                   (Ply, color, opponent, startpos,
                                                toUCI)
+import           Immutable.Shuffle            (shuffle)
 import           RIO                          hiding (Const)
-import           RIO.Partial                  (toEnum)
 import           RIO.Directory                (createDirectoryIfMissing)
 import           RIO.FilePath                 ((</>))
 import           RIO.List                     (unzip3)
-import           RIO.NonEmpty                 ((<|), NonEmpty(..))
+import           RIO.NonEmpty                 (NonEmpty (..), (<|))
+import           RIO.Partial                  (toEnum)
 import qualified RIO.State                    as ST
 import qualified RIO.Vector.Boxed             as VB
 import qualified RIO.Vector.Boxed.Partial     as VB (head)
@@ -41,20 +42,19 @@ import qualified RIO.Vector.Storable          as VS
 import qualified RIO.Vector.Storable.Partial  as VS
 import qualified RIO.Vector.Storable.Unsafe   as VS
 import           System.Random.Stateful
-import           Immutable.Shuffle            (shuffle)
 
 import           Fei.AI.Chess
 import           Fei.AI.MCTS                  hiding (backward)
 import           MXNet.Base
-import           MXNet.Base.Operators.Tensor  as T
 import           MXNet.Base.AutoGrad
+import           MXNet.Base.Operators.Tensor  as T
 import           MXNet.Base.Profiler
 import qualified MXNet.Base.Tensor.Functional as F
 import           MXNet.NN.DataIter.Conduit
 import           MXNet.NN.Initializer
-import           MXNet.NN.Optimizer
 import           MXNet.NN.LrScheduler
 import           MXNet.NN.Module
+import           MXNet.NN.Optimizer
 
 cINPUTSHAPE = [1, 8, 8, 105]
 cROLLOUT = 100
